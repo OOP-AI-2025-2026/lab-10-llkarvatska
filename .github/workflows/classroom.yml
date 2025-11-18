@@ -26,43 +26,49 @@ jobs:
         Оцінити роботу загалом за 100 бальною оцінкою.
 
     steps:
+
+      # Checkout repo
       - uses: actions/checkout@v4
 
+      # Install Java
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: maven
 
-      # 1) Compilation
+      # ==== MAVEN BUILD (app folder) ====
+
       - name: Compile (skip tests)
+        working-directory: ./app
         run: mvn -B -ntp -DskipTests=true clean package
 
-      # 2) Unit tests
       - name: Run Unit Tests
+        working-directory: ./app
         run: mvn -B -ntp test
 
-      # 3) Checkstyle
       - name: Run Checkstyle
+        working-directory: ./app
         run: mvn -B -ntp checkstyle:checkstyle || true
 
-      # 4) PMD
       - name: Run PMD
+        working-directory: ./app
         run: mvn -B -ntp pmd:check || true
 
-      # 5) SpotBugs
       - name: Run SpotBugs
+        working-directory: ./app
         run: mvn -B -ntp com.github.spotbugs:spotbugs-maven-plugin:check || true
 
-      # 6) Spotless (soft check)
       - name: Verify Code Formatting (Spotless, soft)
+        working-directory: ./app
         run: mvn -B -ntp spotless:check || echo "⚠️ Spotless found formatting issues (ignored)"
 
-      # ==== ChatGPT: review all files in package ua.opnu ====
+      # ==== CHATGPT CODE REVIEW ====
+
       - name: Collect ua.opnu Java files
         id: target
         run: |
-          git ls-files | grep -E 'src/.*/ua/opnu/.*\.java$' > java_files_for_review.txt || true
+          find app/src -type f -name "*.java" | grep "ua/opnu" > java_files_for_review.txt || true
           COUNT=$(wc -l < java_files_for_review.txt | xargs)
           echo "count=$COUNT" >> $GITHUB_OUTPUT
           if [ "$COUNT" -gt 0 ]; then
@@ -77,31 +83,43 @@ jobs:
           set -e
           mkdir -p chatgpt
           if [ -z "$OPENAI_API_KEY" ]; then
-            echo "# ChatGPT Review Report\n\n_Not generated (no key)_" > chatgpt/chatgpt_report.md
+            echo "# ChatGPT Review Report\n\n_No API key provided._" > chatgpt/chatgpt_report.md
             exit 0
           fi
 
-          python3 -m pip install --upgrade pip requests
+          python3 -m pip install requests
+
           cat > gpt_review.py << 'PY'
           import os, json, pathlib, requests
+
           api_key = os.environ["OPENAI_API_KEY"]
           model   = os.environ.get("CHATGPT_MODEL","gpt-5-nano")
           system_instructions = os.environ.get("CHATGPT_PROMPT")
 
-          files = [p.strip() for p in open("java_files_for_review.txt","r").read().splitlines() if p.strip()]
+          files = [p.strip() for p in open("java_files_for_review.txt","r") if p.strip()]
           text = ""
           for fp in files:
-              with open(fp,"r",encoding="utf-8",errors="ignore") as f:
-                  text += f"\n\n### FILE: {fp}\n```java\n{f.read()}\n```"
+              try:
+                  with open(fp,"r",encoding="utf-8",errors="ignore") as f:
+                      text += f"\n\n### FILE: {fp}\n```java\n{f.read()}\n```"
+              except:
+                  pass
 
-          headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+          headers = {
+              "Authorization": f"Bearer {api_key}",
+              "Content-Type": "application/json"
+          }
+
           body = {
               "model": model,
               "input": text,
               "instructions": system_instructions,
-              "text": {"format": {"type":"text"}}
+              "text": {"format": {"type": "text"}}
           }
+
           r = requests.post("https://api.openai.com/v1/responses", headers=headers, data=json.dumps(body))
+
+          out = None
           if r.status_code == 200:
               data = r.json()
               out = data.get("output_text")
@@ -112,34 +130,32 @@ jobs:
                           if "text" in c:
                               parts.append(c["text"])
                   out = "\n".join(parts)
-              if not out:
-                  out = "_(No textual content parsed from response)_"
-              pathlib.Path("chatgpt/chatgpt_report.md").write_text(out, encoding="utf-8")
-          else:
-              pathlib.Path("chatgpt/chatgpt_report.md").write_text(
-                  f"API error {r.status_code}: {r.text[:500]}",
-                  encoding="utf-8"
-              )
+          if not out:
+              out = f"Error or empty response:\n{r.text[:500]}"
+
+          pathlib.Path("chatgpt/chatgpt_report.md").write_text(out, encoding="utf-8")
           PY
+
           python3 gpt_review.py
 
+      # Ensure the report exists
       - name: Ensure ChatGPT report exists
         if: always()
         run: |
+          mkdir -p chatgpt
           if [ ! -f chatgpt/chatgpt_report.md ]; then
-            mkdir -p chatgpt
             echo "# ChatGPT Review Report\n\n_Not generated._" > chatgpt/chatgpt_report.md
           fi
 
-      # 7) Archive all reports
+      # Upload reports
       - name: Archive Reports
         uses: actions/upload-artifact@v4
         with:
           name: reports
           path: |
             chatgpt/chatgpt_report.md
-            target/checkstyle-result.xml
-            target/site/checkstyle.html
-            target/site/pmd.html
-            target/spotbugsXml.xml
+            app/target/checkstyle-result.xml
+            app/target/site/checkstyle.html
+            app/target/site/pmd.html
+            app/target/spotbugsXml.xml
           if-no-files-found: warn
